@@ -2466,7 +2466,8 @@ void initialize_repository_version(struct repository *repo,
 	 */
 	if (hash_algo != GIT_HASH_SHA1_LEGACY ||
 	    ref_storage_format != REF_STORAGE_FORMAT_FILES ||
-	    repo->ref_storage_payload)
+	    repo->ref_storage_payload ||
+	    strcmp(repo->object_storage_format, "files"))
 		target_version = GIT_REPO_VERSION_READ;
 
 	if (hash_algo != GIT_HASH_SHA1_LEGACY && hash_algo != GIT_HASH_UNKNOWN)
@@ -2489,6 +2490,12 @@ void initialize_repository_version(struct repository *repo,
 	} else if (reinit) {
 		repo_config_set_gently(repo, "extensions.refstorage", NULL);
 	}
+
+	if (strcmp(repo->object_storage_format, "files"))
+		repo_config_set(repo, "extensions.objectstorage",
+				repo->object_storage_format);
+	else if (reinit)
+		repo_config_set_gently(repo, "extensions.objectstorage", NULL);
 
 	if (reinit) {
 		struct strbuf config = STRBUF_INIT;
@@ -2726,6 +2733,7 @@ static void separate_git_dir(struct repository *repo,
 struct default_format_config {
 	int hash;
 	enum ref_storage_format ref_storage_format;
+	char *object_storage_format;
 };
 
 static int read_default_format_config(const char *key, const char *value,
@@ -2757,6 +2765,20 @@ static int read_default_format_config(const char *key, const char *value,
 		goto out;
 	}
 
+	if (!strcmp(key, "init.defaultobjectstorageformat")) {
+		ret = git_config_string(&str, key, value);
+		if (ret)
+			goto out;
+		if (odb_source_type_by_uri(str, NULL) == ODB_SOURCE_UNKNOWN) {
+			warning(_("unknown object storage format '%s'"), str);
+			goto out;
+		}
+		free(cfg->object_storage_format);
+		cfg->object_storage_format = str;
+		str = NULL;
+		goto out;
+	}
+
 	/*
 	 * Enable the reftable format when "features.experimental" is enabled.
 	 * "init.defaultRefStorageFormat" takes precedence over this setting.
@@ -2777,7 +2799,8 @@ out:
 
 static void repository_format_configure(struct repository_format *repo_fmt,
 					int hash,
-					const char *ref_storage_format_uri)
+					const char *ref_storage_format_uri,
+					const char *object_storage_uri)
 {
 	struct default_format_config cfg = {
 		.hash = GIT_HASH_UNKNOWN,
@@ -2790,6 +2813,7 @@ static void repository_format_configure(struct repository_format *repo_fmt,
 	};
 	enum ref_storage_format ref_storage_format;
 	char *ref_storage_payload = NULL;
+	char *object_storage = NULL;
 	const char *env;
 
 	config_with_options(read_default_format_config, &cfg, NULL, NULL, &opts);
@@ -2878,8 +2902,57 @@ static void repository_format_configure(struct repository_format *repo_fmt,
 	}
 
 	/*
+	 * Determine the object storage format, with the same precedence as
+	 * for the ref storage format:
+	 *
+	 *   1. The format specified via the command line.
+	 *
+	 *   2. The format specified via "GIT_OBJECT_STORAGE_FORMAT".
+	 *
+	 *   3. The format of a preexisting repository when reinitializing.
+	 *
+	 *   4. The default format for new repositories as configured via
+	 *      "GIT_DEFAULT_OBJECT_STORAGE_FORMAT".
+	 *
+	 *   5. The default format for new repositories as configured via
+	 *      "init.defaultObjectStorageFormat".
+	 *
+	 *   6. The "files" format.
+	 */
+	if (object_storage_uri) {
+		if (odb_source_type_by_uri(object_storage_uri, NULL) == ODB_SOURCE_UNKNOWN)
+			die(_("unknown object storage format '%s'"), object_storage_uri);
+		object_storage = xstrdup(object_storage_uri);
+	} else if ((env = getenv(GIT_OBJECT_STORAGE_FORMAT_ENVIRONMENT))) {
+		if (odb_source_type_by_uri(env, NULL) == ODB_SOURCE_UNKNOWN)
+			die(_("unknown object storage format specified via %s: '%s'"),
+			    GIT_OBJECT_STORAGE_FORMAT_ENVIRONMENT, env);
+		object_storage = xstrdup(env);
+	} else if (repo_fmt->version >= 0) {
+		object_storage = xstrdup_or_null(repo_fmt->object_storage);
+	} else if ((env = getenv("GIT_DEFAULT_OBJECT_STORAGE_FORMAT"))) {
+		if (odb_source_type_by_uri(env, NULL) == ODB_SOURCE_UNKNOWN)
+			die(_("unknown object storage format specified via %s: '%s'"),
+			    "GIT_DEFAULT_OBJECT_STORAGE_FORMAT", env);
+		object_storage = xstrdup(env);
+	} else {
+		object_storage = xstrdup_or_null(cfg.object_storage_format);
+	}
+
+	/*
+	 * The "files" format without a payload is the default and thus doesn't
+	 * need to be recorded as an extension.
+	 */
+	if (object_storage) {
+		char *payload = NULL;
+		if (odb_source_type_by_uri(object_storage, &payload) == ODB_SOURCE_FILES && !payload)
+			FREE_AND_NULL(object_storage);
+		free(payload);
+	}
+
+	/*
 	 * If we have a preexisting repository we need to verify that its
-	 * current ref storage format does not change.
+	 * current storage formats do not change.
 	 */
 	if (repo_fmt->version >= 0) {
 		if (ref_storage_format != repo_fmt->ref_storage_format)
@@ -2888,11 +2961,18 @@ static void repository_format_configure(struct repository_format *repo_fmt,
 		    strcmp(ref_storage_payload ? ref_storage_payload : "",
 			   repo_fmt->ref_storage_payload ? repo_fmt->ref_storage_payload : ""))
 			die(_("attempt to reinitialize repository with different reference storage payload"));
+		if (strcmp(object_storage ? object_storage : "",
+			   repo_fmt->object_storage ? repo_fmt->object_storage : ""))
+			die(_("attempt to reinitialize repository with different object storage format"));
 	}
 
 	free(repo_fmt->ref_storage_payload);
 	repo_fmt->ref_storage_format = ref_storage_format;
 	repo_fmt->ref_storage_payload = ref_storage_payload;
+
+	free(repo_fmt->object_storage);
+	repo_fmt->object_storage = object_storage;
+	free(cfg.object_storage_format);
 }
 
 void create_repository(struct repository *repo,
@@ -2902,6 +2982,7 @@ void create_repository(struct repository *repo,
 		       const char *template_dir,
 		       int hash,
 		       const char *ref_storage_format_uri,
+		       const char *object_storage_format_uri,
 		       int init_shared_repository,
 		       int *reinit_ok)
 {
@@ -2940,7 +3021,7 @@ void create_repository(struct repository *repo,
 	 * is an attempt to reinitialize new repository with an old tool.
 	 */
 	read_and_verify_repository_format(&repo_fmt, repo_get_git_dir(repo), NULL);
-	repository_format_configure(&repo_fmt, hash, ref_storage_format_uri);
+	repository_format_configure(&repo_fmt, hash, ref_storage_format_uri, object_storage_format_uri);
 	if (apply_repository_format(repo, &repo_fmt, APPLY_REPOSITORY_FORMAT_HONOR_ENV, &err) < 0)
 		die("%s", err.buf);
 
