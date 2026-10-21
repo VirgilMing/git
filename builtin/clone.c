@@ -686,7 +686,8 @@ static int git_sparse_checkout_init(const char *repo)
 static int checkout(int submodule_progress,
 		    struct list_objects_filter_options *filter_options,
 		    int filter_submodules,
-		    enum ref_storage_format ref_storage_format)
+		    enum ref_storage_format ref_storage_format,
+		    const char *object_storage_format_uri)
 {
 	struct object_id oid;
 	char *head;
@@ -775,6 +776,10 @@ static int checkout(int submodule_progress,
 		if (ref_storage_format != REF_STORAGE_FORMAT_UNKNOWN)
 			strvec_pushf(&cmd.args, "--ref-storage-format=%s",
 				     ref_storage_format_to_name(ref_storage_format));
+
+		if (object_storage_format_uri)
+			strvec_pushf(&cmd.args, "--object-storage-format=%s",
+				     object_storage_format_uri);
 
 		if (filter_submodules && filter_options->choice)
 			strvec_pushf(&cmd.args, "--filter=%s",
@@ -1703,7 +1708,8 @@ int cmd_clone(int argc,
 	err = checkout(submodule_progress,
 		       &filter_options,
 		       filter_submodules,
-		       ref_storage_format);
+		       ref_storage_format,
+		       object_storage_format_uri);
 
 	list_objects_filter_release(&filter_options);
 
